@@ -16,6 +16,9 @@ from pydantic import BaseModel
 from .engine import GridEngine
 from fastapi.middleware.cors import CORSMiddleware
 import os
+import csv, io
+from fastapi import UploadFile, File, Form
+
 
 app = FastAPI(title="Grid Cycle Backtester")
 
@@ -202,3 +205,115 @@ else:
             "ok": True,
             "message": "Frontend not built. Run the UI in dev with Vite or build and copy to backend/app/static."
         }
+
+
+
+
+#-------------------------------------------------------------------------------------------
+@app.post("/api/backtest_csv", response_model=CycleResult)
+async def backtest_csv(
+    file: UploadFile = File(..., description="CSV with at least timestamp+price columns"),
+    symbol: str = Form("TEST"),
+    step: str = Form("0.01"),
+    spread: str = Form("0.01"),
+    rth: bool = Form(False),
+    exact_only: bool = Form(True),
+    level_min: Optional[str] = Form(None),
+    level_max: Optional[str] = Form(None),
+):
+    """
+    Run the grid engine on an uploaded CSV (no Polygon calls).
+    Expected columns (case-insensitive, flexible):
+      - timestamp ns: one of participant_timestamp_ns, participant_timestamp, timestamp_ns, time_ns, ts
+      - or ISO time: iso_utc (as a fallback; will convert to ns)
+      - price: price / trade_price / p
+    """
+    step_d = Decimal(step)
+    spread_d = Decimal(spread)
+    lvl_min_d = Decimal(level_min) if level_min else None
+    lvl_max_d = Decimal(level_max) if level_max else None
+
+    # Load CSV into memory (text) and sniff columns
+    raw = await file.read()
+    reader = csv.DictReader(io.StringIO(raw.decode("utf-8", errors="replace")))
+    rows = list(reader)
+
+    if not rows:
+        raise HTTPException(400, "CSV appears empty")
+
+    # Resolve column names (case-insensitive)
+    def pick(cols, *candidates):
+        lower = {c.lower(): c for c in cols}
+        for cand in candidates:
+            if cand in lower: return lower[cand]
+        # fuzzy contains match
+        for c in cols:
+            lc = c.lower()
+            if any(cand in lc for cand in candidates):
+                return c
+        return None
+
+    cols = rows[0].keys()
+    ts_col = pick(cols,
+        "participant_timestamp_ns","participant_timestamp","timestamp_ns","time_ns","ts")
+    iso_col = pick(cols, "iso_utc","iso","time","timestamp")
+    price_col = pick(cols, "price","trade_price","p")
+
+    if not price_col:
+        raise HTTPException(400, f"Couldn't find a price column in {list(cols)}")
+
+    # Helper to get ns
+    def to_ns(row) -> Optional[int]:
+        if ts_col and row.get(ts_col):
+            try:
+                return int(row[ts_col])
+            except Exception:
+                pass
+        if iso_col and row.get(iso_col):
+            try:
+                dtobj = dt.datetime.fromisoformat(row[iso_col].replace("Z","")).replace(tzinfo=dt.timezone.utc)
+                return int(dtobj.timestamp() * 1_000_000_000)
+            except Exception:
+                pass
+        return None
+
+    # Sort rows by ns (ascending), discard invalid
+    material = []
+    for r in rows:
+        ns = to_ns(r)
+        if ns is None:
+            continue
+        try:
+            price = Decimal(str(r[price_col]))
+        except Exception:
+            continue
+        material.append((ns, price))
+    material.sort(key=lambda x: x[0])
+
+    if not material:
+        raise HTTPException(400, "No usable rows (timestamp/price) found in CSV")
+
+    # Run engine
+    engine = GridEngine(step_d, spread_d, exact_only=exact_only,
+                        level_min=lvl_min_d, level_max=lvl_max_d)
+
+    first_ns = material[0][0]
+    last_ns = material[-1][0]
+
+    for ns, price in material:
+        if rth and not in_rth(ns):
+            continue
+        engine.feed(price, ns)
+
+    out = engine.finalize()
+    return CycleResult(
+        symbol=symbol,
+        step=str(step_d),
+        spread=str(spread_d),
+        start_iso=dt.datetime.utcfromtimestamp(first_ns/1e9).isoformat()+"Z",
+        end_iso=dt.datetime.utcfromtimestamp(last_ns/1e9).isoformat()+"Z",
+        rth=rth,
+        totals=out["totals"],
+        top_levels=out["top_levels"],
+        samples=out["samples"],
+    )
