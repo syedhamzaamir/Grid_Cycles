@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { BarChart, Bar, XAxis, YAxis, Tooltip, CartesianGrid, ResponsiveContainer } from "recharts";
 import { downloadCSV } from "./lib/csv";
 
@@ -27,33 +27,8 @@ const API_BASE = import.meta.env.VITE_API_BASE || ""; // e.g. https://your-backe
 const apiFetch = (path: string, qs: string) => fetch(`${API_BASE}${path}?${qs}`);
 const apiPost = (path: string, body: BodyInit) => fetch(`${API_BASE}${path}`, { method: "POST", body });
 
-function msToNsString(ms: number) {
-  return (BigInt(ms) * 1_000_000n).toString();
-}
-
-// Accept both "YYYY-MM-DD" (date input value) and "dd/mm/yyyy" (typed string)
-function parseDateToMs(s: string): number | null {
-  if (!s) return null;
-
-  // Native <input type="date"> value
-  if (/^\d{4}-\d{2}-\d{2}$/.test(s)) {
-    const t = Date.parse(`${s}T00:00:00.000Z`);
-    return Number.isNaN(t) ? null : t;
-  }
-
-  // dd/mm/yyyy or dd-mm-yyyy
-  const m = s.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
-  if (m) {
-    const dd = m[1].padStart(2, "0");
-    const mm = m[2].padStart(2, "0");
-    const yyyy = m[3];
-    const iso = `${yyyy}-${mm}-${dd}`;
-    const t = Date.parse(`${iso}T00:00:00.000Z`);
-    return Number.isNaN(t) ? null : t;
-  }
-
-  return null;
-}
+// Use ET for date/time picking
+const TZ = "America/New_York";
 
 // ----------------- component -----------------
 export default function App() {
@@ -74,50 +49,30 @@ export default function App() {
 
   // ---------------- Polygon tab state ----------------
   const [symbol, setSymbol] = useState("LCID");
-  const [startDate, setStartDate] = useState<string>("");
-  const [endDate, setEndDate] = useState<string>("");
-  const [useFullDays, setUseFullDays] = useState<boolean>(true);
-  const [startNs, setStartNs] = useState("");
-  const [endNs, setEndNs] = useState("");
-  const [dateError, setDateError] = useState<string>("");
-
-  useEffect(() => {
-    if (!useFullDays) return;
-    const sMs = parseDateToMs(startDate);
-    const eMs = parseDateToMs(endDate);
-
-    if (!sMs || !eMs) {
-      setStartNs("");
-      setEndNs("");
-      setDateError(startDate || endDate ? "Pick valid dates (YYYY-MM-DD or dd/mm/yyyy)" : "");
-      return;
-    }
-    if (eMs < sMs) {
-      setStartNs("");
-      setEndNs("");
-      setDateError("End date must be on/after start date");
-      return;
-    }
-
-    setDateError("");
-    const endMsExclusive = eMs + 24 * 60 * 60 * 1000; // full-day window
-    setStartNs(msToNsString(sMs));
-    setEndNs(msToNsString(endMsExclusive));
-  }, [startDate, endDate, useFullDays]);
+  const [startDate, setStartDate] = useState<string>(""); // "YYYY-MM-DD"
+  const [endDate, setEndDate] = useState<string>("");     // "YYYY-MM-DD"
+  const [startTime, setStartTime] = useState<string>(""); // optional "HH:MM" (24h)
+  const [endTime, setEndTime] = useState<string>("");     // optional "HH:MM"
 
   const runPolygon = async () => {
-    if (!startNs || !endNs) return;
+    if (!startDate || !endDate) {
+      alert("Pick start and end dates (ET).");
+      return;
+    }
     setLoading(true);
     try {
       const params = new URLSearchParams({
         symbol,
-        start_ns: startNs,
-        end_ns: endNs,
+        start_date: startDate,
+        end_date: endDate,
+        tz: TZ,
         step,
         spread,
         rth: String(rth),
         exact_only: String(exactOnly),
       });
+      if (startTime) params.set("start_time", startTime);
+      if (endTime) params.set("end_time", endTime);
       if (levelMin) params.set("level_min", levelMin);
       if (levelMax) params.set("level_max", levelMax);
 
@@ -177,17 +132,21 @@ export default function App() {
 
   const exportServer = async () => {
     if (!data) return;
-    // Only makes sense for Polygon tab (server does the aggregation from Polygon)
-    if (mode !== "polygon") return;
+    if (mode !== "polygon") return; // export from server only for Polygon (uses Polygon data)
+    if (!startDate || !endDate) return;
+
     const params = new URLSearchParams({
       symbol,
-      start_ns: startNs,
-      end_ns: endNs,
+      start_date: startDate,
+      end_date: endDate,
+      tz: TZ,
       step,
       spread,
       rth: String(rth),
       exact_only: String(exactOnly),
     });
+    if (startTime) params.set("start_time", startTime);
+    if (endTime) params.set("end_time", endTime);
     if (levelMin) params.set("level_min", levelMin);
     if (levelMax) params.set("level_max", levelMax);
 
@@ -204,7 +163,7 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
-  const canRunPolygon = !!startNs && !!endNs && !loading;
+  const canRunPolygon = !!startDate && !!endDate && !loading;
   const canRunCSV = !!csvFile && !loading;
 
   return (
@@ -237,20 +196,40 @@ export default function App() {
 
         {/* Forms */}
         {mode === "polygon" ? (
-          <div className="grid md:grid-cols-8 gap-3 items-end bg-white rounded-2xl shadow p-4">
-            <div className="md:col-span-1">
+          <div className="grid md:grid-cols-12 gap-3 items-end bg-white rounded-2xl shadow p-4">
+            <div className="md:col-span-2">
               <label className="block text-sm">Symbol</label>
               <input className="w-full border rounded p-2" value={symbol} onChange={(e) => setSymbol(e.target.value.toUpperCase())} />
             </div>
 
             <div className="md:col-span-2">
-              <label className="block text-sm">Start date (UTC)</label>
+              <label className="block text-sm">Start date (ET)</label>
               <input type="date" className="w-full border rounded p-2" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
             </div>
 
             <div className="md:col-span-2">
-              <label className="block text-sm">End date (UTC)</label>
+              <label className="block text-sm">End date (ET)</label>
               <input type="date" className="w-full border rounded p-2" value={endDate} onChange={(e) => setEndDate(e.target.value)} />
+            </div>
+
+            <div className="md:col-span-2">
+              <label className="block text-sm">Start time (ET, optional)</label>
+              <input
+                type="time"
+                className="w-full border rounded p-2"
+                value={startTime}
+                onChange={(e) => setStartTime(e.target.value)}
+              />
+            </div>
+
+            <div className="md:col-span-2">
+              <label className="block text-sm">End time (ET, optional)</label>
+              <input
+                type="time"
+                className="w-full border rounded p-2"
+                value={endTime}
+                onChange={(e) => setEndTime(e.target.value)}
+              />
             </div>
 
             <div className="md:col-span-1">
@@ -269,7 +248,7 @@ export default function App() {
               </select>
             </div>
 
-            <div className="md:col-span-1">
+            <div className="md:col-span-2">
               <label className="block text-sm">From $ (base ≥)</label>
               <input
                 className="w-full border rounded p-2"
@@ -281,7 +260,7 @@ export default function App() {
               />
             </div>
 
-            <div className="md:col-span-1">
+            <div className="md:col-span-2">
               <label className="block text-sm">To $ (base ≤)</label>
               <input
                 className="w-full border rounded p-2"
@@ -299,16 +278,11 @@ export default function App() {
             </label>
 
             <label className="inline-flex items-center space-x-2 ml-2">
-              <input type="checkbox" checked={useFullDays} onChange={(e) => setUseFullDays(e.target.checked)} />
-              <span>Use full days</span>
-            </label>
-
-            <label className="inline-flex items-center space-x-2 ml-2">
               <input type="checkbox" checked={exactOnly} onChange={(e) => setExactOnly(e.target.checked)} />
               <span>Exact prints only</span>
             </label>
 
-            <div className="md:col-span-8 flex gap-2">
+            <div className="md:col-span-12 flex gap-2">
               <button onClick={runPolygon} disabled={!canRunPolygon} className="bg-black text-white rounded px-4 py-2">
                 {loading ? "Running..." : "Run"}
               </button>
@@ -318,11 +292,6 @@ export default function App() {
               <button onClick={exportServer} disabled={!data} className="border rounded px-4 py-2">
                 Export CSV (server)
               </button>
-            </div>
-
-            <div className="md:col-span-8 text-xs">
-              {useFullDays && <div className="opacity-70">ns window: start={startNs || "—"} end={endNs || "—"}</div>}
-              {dateError && <div className="text-red-600">{dateError}</div>}
             </div>
           </div>
         ) : (
